@@ -38,6 +38,12 @@ import { get } from 'lodash';
 // eslint-disable-next-line import/no-cycle
 import { NodeExecuteFunctions } from '.';
 
+import * as promClient from 'prom-client';
+import { Metrics } from '../../cli/src/metrics/metrics';
+
+let nodeBucket: promClient.Histogram<string>;
+let nodeCounter: promClient.Counter<string>;
+
 export class WorkflowExecute {
 	runExecutionData: IRunExecutionData;
 
@@ -45,10 +51,13 @@ export class WorkflowExecute {
 
 	private mode: WorkflowExecuteMode;
 
+	private metrics?: Metrics;
+
 	constructor(
 		additionalData: IWorkflowExecuteAdditionalData,
 		mode: WorkflowExecuteMode,
 		runExecutionData?: IRunExecutionData,
+		metrics?: Metrics,
 	) {
 		this.additionalData = additionalData;
 		this.mode = mode;
@@ -63,6 +72,21 @@ export class WorkflowExecute {
 				waitingExecution: {},
 			},
 		};
+
+		if (metrics !== undefined) {
+			this.metrics = metrics;
+			nodeBucket = this.metrics.initHistogram(
+				'node_execution',
+				'Execution duration for a node',
+				['execution_id', 'node_name'],
+				[0.5, 1, 10, 30, 60, 1440],
+			);
+			nodeCounter = this.metrics.initCounter(
+				'node_execution_counter',
+				'Node executions status for a workflow',
+				['execution_id', 'nodeName', 'status'],
+			)
+		}
 	}
 
 	/**
@@ -807,6 +831,7 @@ export class WorkflowExecute {
 								}
 							}
 
+							const nodeRunStartTime = new Date().getTime();
 							Logger.debug(`Running node "${executionNode.name}" started`, {
 								node: executionNode.name,
 								workflowId: workflow.id,
@@ -820,10 +845,20 @@ export class WorkflowExecute {
 								NodeExecuteFunctions,
 								this.mode,
 							);
+
+							nodeCounter.labels(workflow.id as string, executionNode.name, 'success').inc();
+							const nodeRunEndTime = new Date().getTime();
 							Logger.debug(`Running node "${executionNode.name}" finished successfully`, {
 								node: executionNode.name,
 								workflowId: workflow.id,
 							});
+
+							const nodeExecTime = nodeRunEndTime - nodeRunStartTime;
+							nodeBucket.labels(workflow.id as string, executionNode.name).observe(nodeExecTime);
+							Logger.debug(`Running node "${executionNode.name}" took ${nodeExecTime}ms`, {
+								node: executionNode.name,
+								workflowId: workflow.id,
+							})
 
 							if (nodeSuccessData === undefined) {
 								// Node did not get executed
@@ -860,6 +895,7 @@ export class WorkflowExecute {
 								stack: (error as NodeOperationError | NodeApiError).stack,
 							};
 
+							nodeCounter.labels(workflow.id as string, executionNode.name, 'error').inc();
 							Logger.debug(`Running node "${executionNode.name}" finished with error`, {
 								node: executionNode.name,
 								workflowId: workflow.id,

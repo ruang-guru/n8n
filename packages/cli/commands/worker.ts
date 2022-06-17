@@ -48,11 +48,6 @@ import {
 } from '../src/UserManagement/UserManagementHelper';
 import { Metrics } from '../src/metrics/metrics';
 
-type WorkflowMetrics = {
-	workflowBucket: promClient.Histogram<string>;
-	workflowCounter: promClient.Counter<string>;
-}
-
 export class Worker extends Command {
 	static description = '\nStarts a n8n worker';
 
@@ -74,15 +69,6 @@ export class Worker extends Command {
 
 	static processExistCode = 0;
 	// static activeExecutions = ActiveExecutions.getInstance();
-
-	initMetrics(): promClient.Registry {
-		const prefix = 'n8n_worker_';
-		const register = new promClient.Registry();
-		register.setDefaultLabels({ prefix });
-		promClient.collectDefaultMetrics({ register });
-
-		return register;
-	}
 
 	getDuration(start: Date, end?: Date): number {
 		if (!end) {
@@ -144,10 +130,22 @@ export class Worker extends Command {
 	async runJob(
 		job: Bull.Job,
 		nodeTypes: INodeTypes,
-		metrics: WorkflowMetrics,
+		metrics: Metrics,
 	): Promise<IBullJobResponse> {
 		const jobData = job.data as IBullJobData;
 		const executionDb = await Db.collections.Execution.findOne(jobData.executionId);
+
+		const workflowBucket = metrics.initHistogram(
+			'workflow_execution',
+			'Execution duration for a workflow',
+			['execution_id', 'workflow_name', 'finished'],
+			[0.5, 1, 10, 30, 60, 1440],
+		);
+		const workflowCounter = metrics.initCounter(
+			'workflow_execution_counter',
+			'Number of successful executions for a workflow',
+			['status'],
+		)
 
 		if (!executionDb) {
 			LoggerProxy.error('Worker failed to find execution data in database. Cannot continue.', {
@@ -244,12 +242,13 @@ export class Worker extends Command {
 				additionalData,
 				currentExecutionDb.mode,
 				currentExecutionDb.data,
+				metrics,
 			);
 			workflowRun = workflowExecute.processRunExecutionData(workflow);
 		} else {
 			// Execute all nodes
 			// Can execute without webhook so go on
-			workflowExecute = new WorkflowExecute(additionalData, currentExecutionDb.mode);
+			workflowExecute = new WorkflowExecute(additionalData, currentExecutionDb.mode, metrics);
 			workflowRun = workflowExecute.run(workflow);
 		}
 
@@ -265,12 +264,12 @@ export class Worker extends Command {
 		const duration = this.getDuration((await workflowRun).startedAt, (await workflowRun).stoppedAt);
 		const workflowError = (await workflowRun).data.resultData.error
 
-		metrics.workflowBucket.labels(executionId, workflowName, finished as unknown as string).observe(duration);
+		workflowBucket.labels(executionId, workflowName, finished as unknown as string).observe(duration);
 
 		if (finished && workflowError === undefined) {
-			metrics.workflowCounter.labels('success').inc();
+			workflowCounter.labels('success').inc();
 		} else {
-			metrics.workflowCounter.labels('failed').inc();
+			workflowCounter.labels('failed').inc();
 		}
 
 		delete Worker.runningJobs[job.id];
@@ -292,19 +291,8 @@ export class Worker extends Command {
 		process.on('SIGINT', Worker.stopProcess);
 
 		// initialize the metrics
-		const registry = this.initMetrics();
+		const registry = new promClient.Registry();
 		const metrics = new Metrics(registry);
-		const workflowBucket = metrics.initHistogram(
-			'workflow_execution',
-			'Execution duration for a workflow',
-			['execution_id', 'workflow_name', 'finished'],
-			[0.5, 1, 10, 30, 60, 1440],
-		);
-		const workflowCounter = metrics.initCounter(
-			'workflow_execution_counter',
-			'Number of successful executions for a workflow',
-			['status'],
-		)
 
 		// Wrap that the process does not close but we can still use async
 		await (async () => {
@@ -351,9 +339,7 @@ export class Worker extends Command {
 				Worker.jobQueue = Queue.getInstance().getBullObjectInstance();
 				// eslint-disable-next-line @typescript-eslint/no-floating-promises
 				Worker.jobQueue.process(flags.concurrency, async (job) =>
-					this.runJob(job, nodeTypes, {
-						workflowBucket, workflowCounter,
-					}),
+					this.runJob(job, nodeTypes, metrics),
 				);
 
 				const versions = await GenericHelpers.getVersions();

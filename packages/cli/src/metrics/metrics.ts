@@ -1,7 +1,12 @@
 import * as promClient from 'prom-client';
 
 export class Metrics {
-	constructor(private register: promClient.Registry) {}
+
+	constructor(private register: promClient.Registry) {
+		const prefix = "n8n_metrics_"
+		register.setDefaultLabels({ prefix });
+		promClient.collectDefaultMetrics({ register });
+	}
 
 	initCounter(name: string, help: string, labels: string[]): promClient.Counter<string> {
 		return new promClient.Counter({
@@ -34,5 +39,9 @@ export class Metrics {
 			buckets,
 			registers: [this.register],
 		});
+	}
+
+	getMetricsRegistry(): promClient.Registry {
+		return this.register;
 	}
 }
